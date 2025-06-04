@@ -1,0 +1,244 @@
+version: '3.8'
+
+services:
+  # Infrastructure Services
+  postgres:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - eshop-network
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - eshop-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - eshop-network
+
+  # Monitoring Services
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    networks:
+      - eshop-network
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    ports:
+      - "3000:3000"
+    networks:
+      - eshop-network
+    depends_on:
+      - prometheus
+
+  # API Services
+  identity-api:
+    build:
+      context: .
+      dockerfile: src/Identity.API/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__identitydb=Host=postgres;Database=identitydb;Username=postgres;Password=postgres
+      - BasketApiClient=http://basket-api:8080
+      - OrderingApiClient=http://ordering-api:8080
+      - WebhooksApiClient=http://webhooks-api:8080
+      - WebAppClient=http://localhost:5100
+      - WebhooksWebClient=http://localhost:5106
+      - ASPNETCORE_FORWARDEDHEADERS_ENABLED=true
+    ports:
+      - "5101:8080"
+    depends_on:
+      - postgres
+    networks:
+      - eshop-network
+
+  catalog-api:
+    build:
+      context: .
+      dockerfile: src/Catalog.API/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__catalogdb=Host=postgres;Database=catalogdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+    ports:
+      - "5102:8080"
+    depends_on:
+      - postgres
+      - rabbitmq
+    networks:
+      - eshop-network
+
+  basket-api:
+    build:
+      context: .
+      dockerfile: src/Basket.API/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__redis=redis:6379
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - Identity__Url=http://identity-api:8080
+    ports:
+      - "5103:8080"
+    depends_on:
+      - redis
+      - rabbitmq
+      - identity-api
+    networks:
+      - eshop-network
+
+  ordering-api:
+    build:
+      context: .
+      dockerfile: src/Ordering.API/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__orderingdb=Host=postgres;Database=orderingdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - Identity__Url=http://identity-api:8080
+    ports:
+      - "5104:8080"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - identity-api
+    networks:
+      - eshop-network
+
+  webhooks-api:
+    build:
+      context: .
+      dockerfile: src/Webhooks.API/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__webhooksdb=Host=postgres;Database=webhooksdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - Identity__Url=http://identity-api:8080
+    ports:
+      - "5105:8080"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - identity-api
+    networks:
+      - eshop-network
+
+  # Background Services
+  order-processor:
+    build:
+      context: .
+      dockerfile: src/OrderProcessor/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__orderingdb=Host=postgres;Database=orderingdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - postgres
+      - rabbitmq
+      - ordering-api
+    networks:
+      - eshop-network
+
+  payment-processor:
+    build:
+      context: .
+      dockerfile: src/PaymentProcessor/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - rabbitmq
+    networks:
+      - eshop-network
+
+  # Web Applications
+  webapp:
+    build:
+      context: .
+      dockerfile: src/WebApp/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - IdentityUrl=http://localhost:5101
+      - CallBackUrl=http://localhost:5100
+      - services__basket-api__http__0=http://basket-api:8080
+      - services__catalog-api__http__0=http://catalog-api:8080
+      - services__ordering-api__http__0=http://ordering-api:8080
+    ports:
+      - "5100:8080"
+    depends_on:
+      - identity-api
+      - catalog-api
+      - basket-api
+      - ordering-api
+      - rabbitmq
+    networks:
+      - eshop-network
+
+  # Webhook Client (if needed)
+  webhooksclient:
+    build:
+      context: .
+      dockerfile: src/WebhookClient/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - IdentityUrl=http://localhost:5101
+      - CallBackUrl=http://localhost:5106
+      - WebhooksUrl=http://webhooks-api:8080
+    ports:
+      - "5106:8080"
+    depends_on:
+      - webhooks-api
+      - identity-api
+    networks:
+      - eshop-network
+
+networks:
+  eshop-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  prometheus_data:
+  grafana_data: 

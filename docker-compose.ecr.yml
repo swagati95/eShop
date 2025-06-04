@@ -1,0 +1,462 @@
+version: '3.8'
+
+services:
+  # Monitoring Services
+  tempo:
+    image: grafana/tempo:latest
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml
+      - tempo_data:/tmp/tempo
+    ports:
+      - "3200:3200"   # tempo
+      - "4317:4317"   # otlp grpc
+      - "4318:4318"   # otlp http
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    networks:
+      - eshop-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--enable-feature=otlp-write-receiver'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    networks:
+      - eshop-network
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    ports:
+      - "3000:3000"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    networks:
+      - eshop-network
+    depends_on:
+      - prometheus
+      - loki
+
+  loki:
+    image: grafana/loki:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - eshop-network
+
+  promtail:
+    image: grafana/promtail:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    volumes:
+      - /var/log:/var/log
+      - ./promtail:/etc/promtail
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - eshop-network
+    depends_on:
+      - loki
+
+  # Infrastructure Services
+  postgres:
+    image: ankane/pgvector:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_MAX_CONNECTIONS: 200
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: 
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "effective_cache_size=1536MB"
+      - "-c"
+      - "max_connections=200"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  redis:
+    image: redis:alpine
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+        reservations:
+          cpus: '0.2'
+          memory: 512M
+    command: redis-server --maxmemory 768mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 1.5G
+        reservations:
+          cpus: '0.3'
+          memory: 768M
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # API Services
+  identity-api:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:identity-api
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 1G
+        reservations:
+          cpus: '0.3'
+          memory: 512M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__identitydb=Host=postgres;Database=identitydb;Username=postgres;Password=postgres
+      - BasketApiClient=http://basket-api:8080
+      - OrderingApiClient=http://ordering-api:8080
+      - WebhooksApiClient=http://webhooks-api:8080
+      - WebAppClient=http://localhost:5100
+      - WebhooksWebClient=http://localhost:5106
+      - ASPNETCORE_FORWARDEDHEADERS_ENABLED=true
+    ports:
+      - "5101:8080"
+    depends_on:
+      - postgres
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  catalog-api:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:catalog-api
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 1G
+        reservations:
+          cpus: '0.3'
+          memory: 512M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__catalogdb=Host=postgres;Database=catalogdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+    ports:
+      - "5102:8080"
+    depends_on:
+      - postgres
+      - rabbitmq
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  basket-api:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:basket-api
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 768M
+        reservations:
+          cpus: '0.2'
+          memory: 384M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__redis=redis:6379
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - Identity__Url=http://identity-api:8080
+    ports:
+      - "5103:8080"
+    depends_on:
+      - redis
+      - rabbitmq
+      - identity-api
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  ordering-api:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:ordering-api
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 1G
+        reservations:
+          cpus: '0.3'
+          memory: 512M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__orderingdb=Host=postgres;Database=orderingdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - Identity__Url=http://identity-api:8080
+    ports:
+      - "5104:8080"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - identity-api
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  webhooks-api:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:webhooks-api
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 768M
+        reservations:
+          cpus: '0.2'
+          memory: 384M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__webhooksdb=Host=postgres;Database=webhooksdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - Identity__Url=http://identity-api:8080
+    ports:
+      - "5105:8080"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - identity-api
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Background Services
+  order-processor:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:order-processor
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 768M
+        reservations:
+          cpus: '0.2'
+          memory: 384M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__orderingdb=Host=postgres;Database=orderingdb;Username=postgres;Password=postgres
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - postgres
+      - rabbitmq
+      - ordering-api
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  payment-processor:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 768M
+        reservations:
+          cpus: '0.2'
+          memory: 384M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - rabbitmq
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Web Applications
+  webapp:
+    image: 526137395256.dkr.ecr.ap-south-1.amazonaws.com/poc_microservice:webapp
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 1G
+        reservations:
+          cpus: '0.3'
+          memory: 512M
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - Metrics__Enabled=true
+      - Metrics__Endpoint=/metrics
+      - ConnectionStrings__eventbus=amqp://guest:guest@rabbitmq:5672
+      - IdentityUrl=http://localhost:5101
+      - CallBackUrl=http://localhost:5100
+      - services__basket-api__http__0=http://basket-api:8080
+      - services__catalog-api__http__0=http://catalog-api:8080
+      - services__ordering-api__http__0=http://ordering-api:8080
+    ports:
+      - "5100:8080"
+    depends_on:
+      - identity-api
+      - catalog-api
+      - basket-api
+      - ordering-api
+      - rabbitmq
+    networks:
+      - eshop-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+networks:
+  eshop-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  tempo_data: 
